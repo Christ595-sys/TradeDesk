@@ -1,0 +1,36 @@
+{
+  "name": "tradedesk",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "postinstall": "prisma generate",
+    "db:generate": "prisma generate",
+    "db:deploy": "prisma migrate deploy",
+    "db:seed-admin": "node --env-file=.env prisma/seed-admin.mjs"
+  },
+  "dependencies": {
+    "next": "^14.2.5",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "next-auth": "^4.24.7",
+    "@prisma/client": "^5.18.0",
+    "bcryptjs": "^2.4.3",
+    "recharts": "^2.12.7",
+    "lucide-react": "^0.400.0"
+  },
+  "devDependencies": {
+    "prisma": "^5.18.0",
+    "tailwindcss": "^3.4.7",
+    "postcss": "^8.4.40",
+    "autoprefixer": "^10.4.19"
+  },
+  "engines": {
+    "node": "24.x"
+  },
+  "prisma": {
+    "seed": "node --env-file=.env prisma/seed-admin.mjs"
+  }
+}
