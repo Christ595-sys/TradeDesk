@@ -1,8 +1,8 @@
-import Link from 'next/link';
 import { redirect } from 'next/navigation';
 import { getVerifiedAdmin } from '@/lib/adminAuth';
 import { prisma } from '@/lib/prisma';
 import AdminSignOut from '@/components/AdminSignOut';
+import AdminUserActions from '@/components/AdminUserActions';
 
 function money(value) {
   return `$${Number(value || 0).toFixed(2)}`;
@@ -65,7 +65,7 @@ export default async function AdminPage() {
             <div className="mono" style={{ textAlign: 'center', color: '#3E4753', fontSize: 12, padding: 48 }}>NO USER ACCOUNTS YET</div>
           ) : (
             <div style={{ overflowX: 'auto' }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 760 }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 880 }}>
                 <thead>
                   <tr className="mono" style={{ color: '#6B7684', fontSize: 10.5, letterSpacing: '0.05em', textAlign: 'left' }}>
                     <th style={{ padding: '10px 16px' }}>USER</th>
@@ -90,7 +90,10 @@ export default async function AdminPage() {
                         <td className="mono" style={{ padding: '12px 16px', textAlign: 'right', fontSize: 12, color: pnl >= 0 ? '#00D9A3' : '#FF4D5E' }}>{money(liveBalance)}</td>
                         <td className="mono" style={{ padding: '12px 16px', fontSize: 11, color: '#6B7684' }}>{user.createdAt.toISOString().slice(0, 10)}</td>
                         <td style={{ padding: '9px 16px', textAlign: 'right' }}>
-                          <Link href={`/admin/users/${user.id}`} className="mono" style={{ display: 'inline-block', textDecoration: 'none', background: 'rgba(0,217,163,0.10)', border: '1px solid rgba(0,217,163,0.24)', color: '#00D9A3', borderRadius: 6, padding: '7px 10px', fontSize: 10.5, fontWeight: 700 }}>VIEW DASHBOARD</Link>
+                          <AdminUserActions
+                            userId={user.id}
+                            userLabel={user.name || user.email}
+                          />
                         </td>
                       </tr>
                     );
