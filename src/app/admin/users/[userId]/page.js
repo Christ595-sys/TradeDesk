@@ -9,8 +9,9 @@ export default async function AdminUserDashboardPage({ params }) {
   if (!session) redirect('/login');
   if (!admin) redirect('/dashboard');
 
+  const { userId } = await params;
   const user = await prisma.user.findFirst({
-    where: { id: params.userId, role: 'USER' },
+    where: { id: userId, role: 'USER' },
     select: { id: true, email: true, name: true, startingBalance: true },
   });
 

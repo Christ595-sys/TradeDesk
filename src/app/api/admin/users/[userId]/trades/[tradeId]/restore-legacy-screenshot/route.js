@@ -1,10 +1,10 @@
 import { NextResponse } from 'next/server';
 import { getVerifiedAdmin } from '@/lib/adminAuth';
 import { prisma } from '@/lib/prisma';
-import { getTradeDetail } from '@/lib/tradeQueries';
+import { restoreLegacyScreenshot } from '@/lib/legacyScreenshot';
 import { createTradeScreenshotAccess } from '@/lib/blobSignedUrls';
 
-export async function GET(req, { params }) {
+export async function POST(req, { params }) {
   const { session, admin } = await getVerifiedAdmin();
   if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   if (!admin) return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
@@ -16,13 +16,15 @@ export async function GET(req, { params }) {
   });
   if (!user) return NextResponse.json({ error: 'User not found.' }, { status: 404 });
 
-  const trade = await getTradeDetail(userId, tradeId);
-  if (!trade) return NextResponse.json({ error: 'Trade not found.' }, { status: 404 });
   try {
-    const access = await createTradeScreenshotAccess(trade, userId);
-    return NextResponse.json({ ...trade, ...access });
+    const result = await restoreLegacyScreenshot(userId, tradeId);
+    if (!result.ok) return NextResponse.json({ error: result.error }, { status: 400 });
+    const access = result.url
+      ? await createTradeScreenshotAccess({ beforeScreenshotUrl: result.url }, userId)
+      : {};
+    return NextResponse.json({ beforeScreenshotUrl: result.url, ...access });
   } catch (error) {
-    console.error('Could not sign admin trade screenshots:', error);
-    return NextResponse.json(trade);
+    console.error('Admin legacy screenshot restore failed:', error);
+    return NextResponse.json({ error: 'Could not restore the old screenshot.' }, { status: 500 });
   }
 }

@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useMemo, useRef } from 'react';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
 import dynamic from 'next/dynamic';
 import { signOut } from 'next-auth/react';
 import {
@@ -23,7 +23,20 @@ const emptyForm = {
   size: '',
   pnl: '',
   notes: '',
-  screenshot: null,
+  beforeScreenshotUrl: null,
+  afterScreenshotUrl: null,
+  beforeScreenshotPreviewUrl: null,
+  afterScreenshotPreviewUrl: null,
+  beforeScreenshotPreview: null,
+  afterScreenshotPreview: null,
+  beforeScreenshotFullLocal: null,
+  afterScreenshotFullLocal: null,
+  beforeScreenshotPreviewAccessUrl: null,
+  afterScreenshotPreviewAccessUrl: null,
+  beforeScreenshotFullAccessUrl: null,
+  afterScreenshotFullAccessUrl: null,
+  screenshotAccessExpiresAt: null,
+  hasLegacyScreenshot: false,
 };
 
 function fmtMoney(n, withSign = true) {
@@ -36,6 +49,13 @@ function fmtMoney(n, withSign = true) {
 function fmtPct(n) {
   if (n === null || n === undefined || Number.isNaN(n) || !Number.isFinite(n)) return '—';
   return `${n.toFixed(1)}%`;
+}
+
+function fmtRawNumber(value) {
+  if (value === null || value === undefined || value === '') return '—';
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n)) return String(value);
+  return String(n);
 }
 
 function getPnl(t) {
@@ -68,28 +88,173 @@ export default function TradeJournal({ userLabel, initialTrades = [], initialSta
   const [sortDir, setSortDir] = useState('desc');
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
   const [formError, setFormError] = useState('');
+  const [screenshotUploads, setScreenshotUploads] = useState({
+    before: { status: 'idle', progress: 0 },
+    after: { status: 'idle', progress: 0 },
+  });
   const [startingBalance, setStartingBalance] = useState(Number(initialStartingBalance) || 0);
   const [showBalanceModal, setShowBalanceModal] = useState(false);
   const [balanceInput, setBalanceInput] = useState(String(Number(initialStartingBalance) || 0));
   const [balanceError, setBalanceError] = useState('');
   const [balanceSaving, setBalanceSaving] = useState(false);
-  const fileInputRef = useRef(null);
+  const beforeFileInputRef = useRef(null);
+  const afterFileInputRef = useRef(null);
+  const screenshotUploadIds = useRef({ before: 0, after: 0 });
+  // Keep the exact short-lived signed URLs while this dashboard is open.
+  // Reopening the same trade can then reuse the browser's image cache instead
+  // of waiting for another signing round-trip before showing screenshots.
+  const screenshotAccessCache = useRef(new Map());
+  // Tracks files uploaded during the currently open form but not yet attached
+  // to a saved trade. This lets us clean them up if the user closes/replaces
+  // the screenshot before saving, so the Blob store does not accumulate orphans.
+  const pendingScreenshotBlobs = useRef({ before: null, after: null });
+
+  function pendingReferences(kind = null) {
+    const entries = kind
+      ? [pendingScreenshotBlobs.current[kind]]
+      : [pendingScreenshotBlobs.current.before, pendingScreenshotBlobs.current.after];
+    return [...new Set(entries.flatMap((entry) => entry ? [entry.fullUrl, entry.previewUrl].filter(Boolean) : []))];
+  }
+
+  async function cleanupScreenshotReferences(references, keepalive = false) {
+    const unique = [...new Set((references || []).filter(Boolean))];
+    if (!unique.length) return;
+    try {
+      await fetch('/api/blob/cleanup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ references: unique }),
+        keepalive,
+      });
+    } catch (error) {
+      console.warn('Could not clean up unused screenshot files.', error);
+    }
+  }
+
+  function cleanupPendingScreenshotBlobs(kind = null, keepalive = false) {
+    const references = pendingReferences(kind);
+    if (kind) pendingScreenshotBlobs.current[kind] = null;
+    else pendingScreenshotBlobs.current = { before: null, after: null };
+    if (references.length) void cleanupScreenshotReferences(references, keepalive);
+  }
+
+  function rememberPendingScreenshotBlobs(kind, uploaded) {
+    pendingScreenshotBlobs.current[kind] = {
+      fullUrl: uploaded?.fullUrl || null,
+      previewUrl: uploaded?.previewUrl || null,
+    };
+  }
+
+  function markPendingScreenshotsCommitted() {
+    pendingScreenshotBlobs.current = { before: null, after: null };
+  }
+
+  useEffect(() => {
+    const cleanupOnPageHide = () => {
+      const references = pendingReferences();
+      if (!references.length) return;
+      pendingScreenshotBlobs.current = { before: null, after: null };
+      try {
+        void fetch('/api/blob/cleanup', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ references }),
+          keepalive: true,
+        });
+      } catch {}
+    };
+    window.addEventListener('pagehide', cleanupOnPageHide);
+    return () => window.removeEventListener('pagehide', cleanupOnPageHide);
+  }, []);
+
+  function getCachedScreenshotAccess(tradeId) {
+    const cached = screenshotAccessCache.current.get(tradeId);
+    if (!cached) return null;
+    if (cached.screenshotAccessExpiresAt && cached.screenshotAccessExpiresAt <= Date.now() + 60 * 1000) {
+      screenshotAccessCache.current.delete(tradeId);
+      return null;
+    }
+    return cached;
+  }
+
+  function rememberScreenshotAccess(tradeId, data) {
+    if (!tradeId || !data) return;
+    const access = {
+      beforeScreenshotPreviewAccessUrl: data.beforeScreenshotPreviewAccessUrl || null,
+      beforeScreenshotFullAccessUrl: data.beforeScreenshotFullAccessUrl || null,
+      afterScreenshotPreviewAccessUrl: data.afterScreenshotPreviewAccessUrl || null,
+      afterScreenshotFullAccessUrl: data.afterScreenshotFullAccessUrl || null,
+      screenshotAccessExpiresAt: data.screenshotAccessExpiresAt || null,
+    };
+    if (Object.values(access).some(Boolean)) screenshotAccessCache.current.set(tradeId, access);
+    else screenshotAccessCache.current.delete(tradeId);
+  }
+
+  function resetScreenshotUploads() {
+    screenshotUploadIds.current.before += 1;
+    screenshotUploadIds.current.after += 1;
+    setScreenshotUploads({
+      before: { status: 'idle', progress: 0 },
+      after: { status: 'idle', progress: 0 },
+    });
+  }
+
+  function setScreenshotUpload(kind, patch) {
+    setScreenshotUploads((current) => ({
+      ...current,
+      [kind]: { ...current[kind], ...patch },
+    }));
+  }
 
   function openAdd() {
     if (readOnly) return;
+    cleanupPendingScreenshotBlobs();
     setForm(emptyForm);
     setEditingId(null);
     setDetailLoading(false);
     setDetailLoadFailed(false);
     setFormError('');
+    resetScreenshotUploads();
     setShowForm(true);
   }
 
+  async function restoreLegacyScreenshotForOpen(tradeId) {
+    setScreenshotUpload('before', { status: 'restoring', progress: 0 });
+    try {
+      const res = await fetch(`${tradeDetailBasePath}/${tradeId}/restore-legacy-screenshot`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Could not restore old screenshot');
+      rememberScreenshotAccess(tradeId, data);
+      setForm((current) => ({
+        ...current,
+        beforeScreenshotUrl: data.beforeScreenshotUrl || current.beforeScreenshotUrl,
+        beforeScreenshotPreviewAccessUrl: data.beforeScreenshotPreviewAccessUrl || data.beforeScreenshotFullAccessUrl || current.beforeScreenshotPreviewAccessUrl,
+        beforeScreenshotFullAccessUrl: data.beforeScreenshotFullAccessUrl || current.beforeScreenshotFullAccessUrl,
+        screenshotAccessExpiresAt: data.screenshotAccessExpiresAt || current.screenshotAccessExpiresAt,
+        hasLegacyScreenshot: false,
+      }));
+      if (data.beforeScreenshotUrl) {
+        setTrades((current) => current.map((trade) =>
+          trade.id === tradeId
+            ? { ...trade, hasBeforeScreenshot: true, hasScreenshot: true }
+            : trade
+        ));
+      }
+      setScreenshotUpload('before', { status: 'uploaded', progress: 100 });
+    } catch (error) {
+      console.error(error);
+      setScreenshotUpload('before', { status: 'restore-error', progress: 0 });
+    }
+  }
+
   async function openEdit(t) {
-    setForm(toFormShape(t));
+    cleanupPendingScreenshotBlobs();
+    const cachedAccess = getCachedScreenshotAccess(t.id);
+    setForm(toFormShape(cachedAccess ? { ...t, ...cachedAccess } : t));
     setEditingId(t.id);
     setFormError('');
     setDetailLoadFailed(false);
+    resetScreenshotUploads();
     setDetailLoading(true);
     setShowForm(true);
 
@@ -97,7 +262,11 @@ export default function TradeJournal({ userLabel, initialTrades = [], initialSta
       const res = await fetch(`${tradeDetailBasePath}/${t.id}`, { cache: 'no-store' });
       if (!res.ok) throw new Error('Could not load trade details');
       const detail = await res.json();
+      rememberScreenshotAccess(t.id, detail);
       setForm(toFormShape(detail));
+      if (detail.hasLegacyScreenshot && !detail.beforeScreenshotUrl) {
+        restoreLegacyScreenshotForOpen(t.id);
+      }
     } catch {
       setDetailLoadFailed(true);
       setFormError('Could not load this trade. Close the window and try again.');
@@ -107,49 +276,332 @@ export default function TradeJournal({ userLabel, initialTrades = [], initialSta
   }
 
   function closeForm() {
+    cleanupPendingScreenshotBlobs(null, true);
+    [
+      form.beforeScreenshotPreview,
+      form.afterScreenshotPreview,
+      form.beforeScreenshotFullLocal,
+      form.afterScreenshotFullLocal,
+    ].forEach((value) => {
+      if (value?.startsWith('blob:')) URL.revokeObjectURL(value);
+    });
     setShowForm(false);
     setEditingId(null);
     setDetailLoading(false);
     setDetailLoadFailed(false);
     setForm(emptyForm);
     setFormError('');
+    resetScreenshotUploads();
   }
 
-  function handleScreenshotChange(e) {
+  async function prepareScreenshotFiles(file) {
+    if (!file.type.startsWith('image/')) throw new Error('Invalid screenshot type.');
+
+    const sourceUrl = URL.createObjectURL(file);
+    try {
+      const image = await new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = reject;
+        img.src = sourceUrl;
+      });
+
+      const render = async (maxWidth, maxHeight, quality, suffix) => {
+        const scale = Math.min(1, maxWidth / image.width, maxHeight / image.height);
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(image.width * scale));
+        canvas.height = Math.max(1, Math.round(image.height * scale));
+        const ctx = canvas.getContext('2d', { alpha: false });
+        ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+        const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/webp', quality));
+        if (!blob) throw new Error('Could not optimize screenshot.');
+        const base = file.name.replace(/\.[^.]+$/, '') || 'trade-screenshot';
+        return new File([blob], `${base}-${suffix}.webp`, { type: 'image/webp' });
+      };
+
+      // The full image keeps enough detail for the zoom viewer but stays small
+      // enough for quick direct uploads on typical mobile connections.
+      let fullFile = await render(1600, 1200, 0.76, 'full');
+      if (fullFile.size > 1200 * 1024) fullFile = await render(1400, 1050, 0.66, 'full');
+      if (fullFile.size > 1200 * 1024) fullFile = await render(1200, 900, 0.58, 'full');
+
+      // This is the image shown inside the trade modal. It is intentionally
+      // much smaller so the trade opens quickly; zoom uses the full image.
+      let previewFile = await render(800, 600, 0.58, 'preview');
+      if (previewFile.size > 350 * 1024) previewFile = await render(680, 510, 0.5, 'preview');
+
+      return { fullFile, previewFile };
+    } finally {
+      URL.revokeObjectURL(sourceUrl);
+    }
+  }
+
+  async function handleScreenshotChange(e, kind) {
     const file = e.target.files && e.target.files[0];
     if (!file) return;
 
-    const readOriginal = () => {
-      const reader = new FileReader();
-      reader.onload = () => setForm((current) => ({ ...current, screenshot: reader.result }));
-      reader.readAsDataURL(file);
-    };
-
-    if (file.size <= 900 * 1024) {
-      readOriginal();
+    if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
+      setFormError('Screenshots must be JPG, PNG, or WebP images.');
+      e.target.value = '';
       return;
     }
 
-    const objectUrl = URL.createObjectURL(file);
-    const image = new Image();
-    image.onload = () => {
-      const maxWidth = 1600;
-      const maxHeight = 1000;
-      const scale = Math.min(1, maxWidth / image.width, maxHeight / image.height);
-      const canvas = document.createElement('canvas');
-      canvas.width = Math.max(1, Math.round(image.width * scale));
-      canvas.height = Math.max(1, Math.round(image.height * scale));
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
-      const compressed = canvas.toDataURL('image/webp', 0.82);
-      URL.revokeObjectURL(objectUrl);
-      setForm((current) => ({ ...current, screenshot: compressed }));
+    // A previously uploaded-but-unsaved replacement is no longer needed.
+    cleanupPendingScreenshotBlobs(kind);
+    const requestId = screenshotUploadIds.current[kind] + 1;
+    screenshotUploadIds.current[kind] = requestId;
+    setFormError('');
+    setScreenshotUpload(kind, { status: 'preparing', progress: 0 });
+
+    const fullUrlKey = kind === 'before' ? 'beforeScreenshotUrl' : 'afterScreenshotUrl';
+    const previewUrlKey = kind === 'before' ? 'beforeScreenshotPreviewUrl' : 'afterScreenshotPreviewUrl';
+    const localPreviewKey = kind === 'before' ? 'beforeScreenshotPreview' : 'afterScreenshotPreview';
+    const localFullKey = kind === 'before' ? 'beforeScreenshotFullLocal' : 'afterScreenshotFullLocal';
+    const previewAccessKey = kind === 'before' ? 'beforeScreenshotPreviewAccessUrl' : 'afterScreenshotPreviewAccessUrl';
+    const fullAccessKey = kind === 'before' ? 'beforeScreenshotFullAccessUrl' : 'afterScreenshotFullAccessUrl';
+
+    try {
+      const { fullFile, previewFile } = await prepareScreenshotFiles(file);
+      if (screenshotUploadIds.current[kind] !== requestId) return;
+
+      const localPreview = URL.createObjectURL(previewFile);
+      const localFull = URL.createObjectURL(fullFile);
+      setForm((current) => {
+        if (current[localPreviewKey]?.startsWith('blob:')) URL.revokeObjectURL(current[localPreviewKey]);
+        if (current[localFullKey]?.startsWith('blob:')) URL.revokeObjectURL(current[localFullKey]);
+        return {
+          ...current,
+          [localPreviewKey]: localPreview,
+          [localFullKey]: localFull,
+          [previewAccessKey]: null,
+          [fullAccessKey]: null,
+        };
+      });
+
+      setScreenshotUpload(kind, { status: 'uploading', progress: 1 });
+      const uploaded = await uploadScreenshotFiles(
+        fullFile,
+        previewFile,
+        kind,
+        (percentage) => {
+          if (screenshotUploadIds.current[kind] === requestId) {
+            setScreenshotUpload(kind, { status: 'uploading', progress: Math.max(1, Math.round(percentage || 0)) });
+          }
+        },
+        () => {
+          if (screenshotUploadIds.current[kind] === requestId) {
+            setScreenshotUpload(kind, { status: 'finalizing', progress: 100 });
+          }
+        }
+      );
+
+      if (screenshotUploadIds.current[kind] !== requestId) {
+        void cleanupScreenshotReferences([uploaded.fullUrl, uploaded.previewUrl]);
+        return;
+      }
+      rememberPendingScreenshotBlobs(kind, uploaded);
+      setForm((current) => ({
+        ...current,
+        [fullUrlKey]: uploaded.fullUrl,
+        [previewUrlKey]: uploaded.previewUrl,
+      }));
+      setScreenshotUpload(kind, { status: 'uploaded', progress: 100 });
+    } catch (error) {
+      console.error(error);
+      if (screenshotUploadIds.current[kind] === requestId) {
+        setScreenshotUpload(kind, { status: 'error', progress: 0 });
+        setFormError(`Could not upload the ${kind} screenshot. Remove it or choose it again.`);
+      }
+    } finally {
+      e.target.value = '';
+    }
+  }
+
+  async function requestScreenshotUploadUrls(fullFile, previewFile, kind) {
+    const response = await fetch('/api/blob/presign-upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        kind,
+        full: { contentType: fullFile.type, size: fullFile.size },
+        preview: { contentType: previewFile.type, size: previewFile.size },
+      }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.full?.uploadUrl || !data.preview?.uploadUrl) {
+      throw new Error(data.error || 'Could not prepare screenshot upload.');
+    }
+    return data;
+  }
+
+  function uploadFileToSignedUrl(file, uploadUrl, onProgress, onBodySent) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('PUT', uploadUrl);
+      xhr.timeout = 45000;
+      xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) onProgress?.(event.loaded, event.total);
+      };
+      xhr.upload.onload = () => onBodySent?.();
+      xhr.onerror = () => reject(new Error('Screenshot upload failed.'));
+      xhr.ontimeout = () => reject(new Error('Screenshot upload timed out.'));
+      xhr.onabort = () => reject(new Error('Screenshot upload was cancelled.'));
+      xhr.onload = () => {
+        let data = {};
+        try { data = JSON.parse(xhr.responseText || '{}'); } catch {}
+        if (xhr.status >= 200 && xhr.status < 300 && data.url) resolve(data);
+        else reject(new Error(data.error || `Screenshot upload failed (${xhr.status}).`));
+      };
+      xhr.send(file);
+    });
+  }
+
+  function uploadFileViaServer(file, kind, onProgress, onBodySent) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      const data = new FormData();
+      data.append('file', file);
+      data.append('kind', kind);
+      xhr.open('POST', '/api/blob/server-upload');
+      xhr.timeout = 60000;
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) onProgress?.(event.loaded, event.total);
+      };
+      xhr.upload.onload = () => onBodySent?.();
+      xhr.onerror = () => reject(new Error('Fallback screenshot upload failed.'));
+      xhr.ontimeout = () => reject(new Error('Fallback screenshot upload timed out.'));
+      xhr.onabort = () => reject(new Error('Fallback screenshot upload was cancelled.'));
+      xhr.onload = () => {
+        let result = {};
+        try { result = JSON.parse(xhr.responseText || '{}'); } catch {}
+        if (xhr.status >= 200 && xhr.status < 300 && result.url) resolve(result);
+        else reject(new Error(result.error || `Fallback screenshot upload failed (${xhr.status}).`));
+      };
+      xhr.send(data);
+    });
+  }
+
+  async function uploadScreenshotFiles(fullFile, previewFile, kind, onProgress, onFinalizing) {
+    if (fullFile.size > 2 * 1024 * 1024 || previewFile.size > 600 * 1024) {
+      throw new Error('Screenshot is still too large after optimization.');
+    }
+
+    const totals = { full: fullFile.size, preview: previewFile.size };
+    const loaded = { full: 0, preview: 0 };
+    const totalBytes = totals.full + totals.preview;
+    const report = () => {
+      const current = loaded.full + loaded.preview;
+      onProgress?.(Math.min(98, Math.max(1, (current / totalBytes) * 100)));
     };
-    image.onerror = () => {
-      URL.revokeObjectURL(objectUrl);
-      readOriginal();
-    };
-    image.src = objectUrl;
+
+    // Fast path: the browser writes straight to the private Blob store with
+    // short-lived signed PUT URLs. If that direct connection is unreliable on
+    // a particular network/browser, automatically fall back to V11's proven
+    // authenticated TradeDesk server upload instead of leaving the UI stuck.
+    try {
+      const targets = await requestScreenshotUploadUrls(fullFile, previewFile, kind);
+      const sent = { full: false, preview: false };
+      const bodySent = (which) => {
+        sent[which] = true;
+        if (sent.full && sent.preview) onFinalizing?.();
+      };
+
+      const directResults = await Promise.allSettled([
+        uploadFileToSignedUrl(
+          fullFile,
+          targets.full.uploadUrl,
+          (value) => { loaded.full = value; report(); },
+          () => bodySent('full')
+        ),
+        uploadFileToSignedUrl(
+          previewFile,
+          targets.preview.uploadUrl,
+          (value) => { loaded.preview = value; report(); },
+          () => bodySent('preview')
+        ),
+      ]);
+
+      if (directResults.every((result) => result.status === 'fulfilled')) {
+        const [fullResult, previewResult] = directResults.map((result) => result.value);
+        onFinalizing?.();
+        return { fullUrl: fullResult.url, previewUrl: previewResult.url };
+      }
+
+      // If one direct PUT completed and the other failed (or a response was
+      // lost), delete both generated pathnames before switching to fallback.
+      // Vercel Blob delete is safe when a pathname does not exist.
+      await cleanupScreenshotReferences([targets.full.pathname, targets.preview.pathname]);
+      const firstFailure = directResults.find((result) => result.status === 'rejected');
+      throw firstFailure?.reason || new Error('Direct screenshot upload failed.');
+    } catch (directError) {
+      console.warn('Direct signed screenshot upload failed; using server fallback.', directError);
+      loaded.full = 0;
+      loaded.preview = 0;
+      onProgress?.(1);
+
+      const sent = { full: false, preview: false };
+      const bodySent = (which) => {
+        sent[which] = true;
+        if (sent.full && sent.preview) onFinalizing?.();
+      };
+      const fallbackResults = await Promise.allSettled([
+        uploadFileViaServer(
+          fullFile,
+          kind,
+          (value) => { loaded.full = value; report(); },
+          () => bodySent('full')
+        ),
+        uploadFileViaServer(
+          previewFile,
+          kind,
+          (value) => { loaded.preview = value; report(); },
+          () => bodySent('preview')
+        ),
+      ]);
+
+      if (!fallbackResults.every((result) => result.status === 'fulfilled')) {
+        const completedUrls = fallbackResults
+          .filter((result) => result.status === 'fulfilled')
+          .map((result) => result.value?.url)
+          .filter(Boolean);
+        await cleanupScreenshotReferences(completedUrls);
+        const firstFailure = fallbackResults.find((result) => result.status === 'rejected');
+        throw firstFailure?.reason || new Error('Fallback screenshot upload failed.');
+      }
+
+      const [fullResult, previewResult] = fallbackResults.map((result) => result.value);
+      onFinalizing?.();
+      return { fullUrl: fullResult.url, previewUrl: previewResult.url };
+    }
+  }
+
+  function removeScreenshot(kind) {
+    screenshotUploadIds.current[kind] += 1;
+    cleanupPendingScreenshotBlobs(kind);
+    const fullUrlKey = kind === 'before' ? 'beforeScreenshotUrl' : 'afterScreenshotUrl';
+    const previewUrlKey = kind === 'before' ? 'beforeScreenshotPreviewUrl' : 'afterScreenshotPreviewUrl';
+    const localPreviewKey = kind === 'before' ? 'beforeScreenshotPreview' : 'afterScreenshotPreview';
+    const localFullKey = kind === 'before' ? 'beforeScreenshotFullLocal' : 'afterScreenshotFullLocal';
+    const previewAccessKey = kind === 'before' ? 'beforeScreenshotPreviewAccessUrl' : 'afterScreenshotPreviewAccessUrl';
+    const fullAccessKey = kind === 'before' ? 'beforeScreenshotFullAccessUrl' : 'afterScreenshotFullAccessUrl';
+    setForm((current) => {
+      if (current[localPreviewKey]?.startsWith('blob:')) URL.revokeObjectURL(current[localPreviewKey]);
+      if (current[localFullKey]?.startsWith('blob:')) URL.revokeObjectURL(current[localFullKey]);
+      return {
+        ...current,
+        [fullUrlKey]: null,
+        [previewUrlKey]: null,
+        [localPreviewKey]: null,
+        [localFullKey]: null,
+        [previewAccessKey]: null,
+        [fullAccessKey]: null,
+        ...(kind === 'before' ? { hasLegacyScreenshot: false } : {}),
+      };
+    });
+    setScreenshotUpload(kind, { status: 'idle', progress: 0 });
+    setFormError('');
   }
 
   async function handleSubmit(e) {
@@ -162,9 +614,40 @@ export default function TradeJournal({ userLabel, initialTrades = [], initialSta
 
     setFormError('');
     setSaving(true);
-    const payload = { ...form, symbol: form.symbol.trim().toUpperCase() };
+
+    const blockingScreenshot = ['before', 'after'].find((kind) =>
+      ['preparing', 'uploading', 'finalizing', 'error'].includes(screenshotUploads[kind].status)
+    );
+    if (blockingScreenshot) {
+      const status = screenshotUploads[blockingScreenshot].status;
+      setFormError(status === 'error'
+        ? `Fix or remove the ${blockingScreenshot} screenshot before saving.`
+        : `The ${blockingScreenshot} screenshot is still uploading. You can keep editing while it finishes.`);
+      setSaving(false);
+      return;
+    }
 
     try {
+      const beforeScreenshotUrl = form.beforeScreenshotUrl || null;
+      const afterScreenshotUrl = form.afterScreenshotUrl || null;
+      const beforeScreenshotPreviewUrl = form.beforeScreenshotPreviewUrl || null;
+      const afterScreenshotPreviewUrl = form.afterScreenshotPreviewUrl || null;
+
+      const payload = {
+        symbol: form.symbol.trim().toUpperCase(),
+        direction: form.direction,
+        date: form.date,
+        entryPrice: form.entryPrice,
+        stopLoss: form.stopLoss,
+        size: form.size,
+        pnl: form.pnl,
+        notes: form.notes,
+        beforeScreenshotUrl,
+        afterScreenshotUrl,
+        beforeScreenshotPreviewUrl,
+        afterScreenshotPreviewUrl,
+      };
+
       let res;
       if (editingId) {
         res = await fetch(`/api/trades/${editingId}`, {
@@ -185,15 +668,20 @@ export default function TradeJournal({ userLabel, initialTrades = [], initialSta
         setSaving(false);
         return;
       }
+      // The database has accepted these Blob URLs. From this point on they
+      // are no longer temporary/orphan candidates even if rendering the
+      // response later fails on the client.
+      markPendingScreenshotsCommitted();
       const saved = await res.json();
-      const listItem = { ...saved, hasScreenshot: Boolean(form.screenshot) };
+      if (editingId) screenshotAccessCache.current.delete(editingId);
       setTrades((prev) =>
-        editingId ? prev.map((t) => (t.id === editingId ? listItem : t)) : [listItem, ...prev]
+        editingId ? prev.map((t) => (t.id === editingId ? saved : t)) : [saved, ...prev]
       );
       setSaving(false);
       closeForm();
     } catch (err) {
-      setFormError('Network error — could not reach the server.');
+      console.error(err);
+      setFormError('Could not save the trade. Check your connection and try again.');
       setSaving(false);
     }
   }
@@ -202,7 +690,10 @@ export default function TradeJournal({ userLabel, initialTrades = [], initialSta
     if (readOnly) return;
     try {
       const res = await fetch(`/api/trades/${id}`, { method: 'DELETE' });
-      if (res.ok) setTrades((prev) => prev.filter((t) => t.id !== id));
+      if (res.ok) {
+        screenshotAccessCache.current.delete(id);
+        setTrades((prev) => prev.filter((t) => t.id !== id));
+      }
     } finally {
       setConfirmDeleteId(null);
     }
@@ -317,6 +808,10 @@ export default function TradeJournal({ userLabel, initialTrades = [], initialSta
       .slice(0, 10);
   }, [closedTrades]);
   const equityPositive = stats.totalPnl >= 0;
+
+  const screenshotSaveBlocked = ['before', 'after'].some((kind) =>
+    ['preparing', 'uploading', 'finalizing', 'error'].includes(screenshotUploads[kind].status)
+  );
 
   return (
     <div className="trade-shell" style={{
@@ -520,7 +1015,7 @@ export default function TradeJournal({ userLabel, initialTrades = [], initialSta
                             <td style={{ padding: '10px 14px', fontWeight: 700 }}>
                               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                                 {t.symbol}
-                                {t.hasScreenshot && <ImageIcon size={11} color="#3E4753" />}
+                                {t.hasScreenshot && <ImageIcon size={11} color="#3E4753" title={`${t.hasBeforeScreenshot ? 'Before ' : ''}${t.hasAfterScreenshot ? 'After' : ''} screenshot`} />}
                               </span>
                             </td>
                             <td style={{ padding: '10px 14px' }}>
@@ -528,8 +1023,8 @@ export default function TradeJournal({ userLabel, initialTrades = [], initialSta
                                 {t.direction === 'long' ? 'LONG' : 'SHORT'}
                               </span>
                             </td>
-                            <td style={{ padding: '10px 14px', textAlign: 'right' }}>{t.entryPrice !== null && t.entryPrice !== undefined ? `$${parseFloat(t.entryPrice).toFixed(2)}` : '—'}</td>
-                            <td style={{ padding: '10px 14px', textAlign: 'right' }}>{t.stopLoss !== null && t.stopLoss !== undefined ? `$${parseFloat(t.stopLoss).toFixed(2)}` : '—'}</td>
+                            <td style={{ padding: '10px 14px', textAlign: 'right' }}>{t.entryPrice !== null && t.entryPrice !== undefined ? `$${fmtRawNumber(t.entryPrice)}` : '—'}</td>
+                            <td style={{ padding: '10px 14px', textAlign: 'right' }}>{t.stopLoss !== null && t.stopLoss !== undefined ? `$${fmtRawNumber(t.stopLoss)}` : '—'}</td>
                             <td style={{ padding: '10px 14px', textAlign: 'right' }}>{t.size ?? '—'}</td>
                             <td style={{ padding: '10px 14px', textAlign: 'right', fontWeight: 700, color: isOpen ? '#F5A623' : pnl >= 0 ? '#00D9A3' : '#FF4D5E' }}>
                               {isOpen ? 'OPEN' : fmtMoney(pnl)}
@@ -570,7 +1065,7 @@ export default function TradeJournal({ userLabel, initialTrades = [], initialSta
 
       {showForm && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(4,6,9,0.75)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50, padding: 16 }}>
-          <form onSubmit={readOnly ? (e) => e.preventDefault() : handleSubmit} style={{ background: '#0B0F16', border: '1px solid #1E2630', borderRadius: 12, width: '100%', maxWidth: 480, maxHeight: '88vh', overflowY: 'auto', padding: 22 }}>
+          <form onSubmit={readOnly ? (e) => e.preventDefault() : handleSubmit} style={{ background: '#0B0F16', border: '1px solid #1E2630', borderRadius: 12, width: '100%', maxWidth: 760, maxHeight: '88vh', overflowY: 'auto', padding: 22 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 }}>
               <h2 className="mono" style={{ margin: 0, fontSize: 15, fontWeight: 700, letterSpacing: '0.03em' }}>{readOnly ? 'TRADE DETAILS' : editingId ? 'EDIT TRADE' : 'LOG NEW TRADE'}</h2>
               <button type="button" onClick={closeForm} style={iconBtnStyle} aria-label="Close"><X size={16} color="#6B7684" /></button>
@@ -599,11 +1094,11 @@ export default function TradeJournal({ userLabel, initialTrades = [], initialSta
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
               <div>
                 <label className="td-label">Entry price</label>
-                <input className="td-input" disabled={readOnly} type="number" step="0.01" placeholder="0.00" value={form.entryPrice} onChange={(e) => setForm({ ...form, entryPrice: e.target.value })} />
+                <input className="td-input" disabled={readOnly} type="number" step="any" placeholder="0.00000" value={form.entryPrice} onChange={(e) => setForm({ ...form, entryPrice: e.target.value })} />
               </div>
               <div>
                 <label className="td-label">Stop loss</label>
-                <input className="td-input" disabled={readOnly} type="number" step="0.01" placeholder="0.00" value={form.stopLoss} onChange={(e) => setForm({ ...form, stopLoss: e.target.value })} />
+                <input className="td-input" disabled={readOnly} type="number" step="any" placeholder="0.00000" value={form.stopLoss} onChange={(e) => setForm({ ...form, stopLoss: e.target.value })} />
               </div>
             </div>
 
@@ -625,36 +1120,38 @@ export default function TradeJournal({ userLabel, initialTrades = [], initialSta
 
             <div style={{ marginBottom: 12 }}>
               <label className="td-label">Notes</label>
-              <textarea className="td-input" disabled={readOnly} rows={3} placeholder="What was the thesis? How did it play out?" style={{ resize: 'vertical', fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" }} value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} />
+              <textarea className="td-input" disabled={readOnly} rows={3} placeholder="What was the thesis? How did it play out?" style={{ resize: 'vertical', fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" }} value={form.notes ?? ''} onChange={(e) => setForm({ ...form, notes: e.target.value })} />
             </div>
 
-            <div style={{ marginBottom: 18 }}>
-              <label className="td-label">Chart screenshot</label>
-              <input ref={fileInputRef} type="file" accept="image/*" onChange={handleScreenshotChange} style={{ display: 'none' }} />
-              {form.screenshot ? (
-                <div style={{ position: 'relative' }}>
-                  <img src={form.screenshot} alt="Trade screenshot" style={{ width: '100%', borderRadius: 8, border: '1px solid #1E2630', display: 'block' }} />
-                  {!readOnly && (
-                    <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-                      <button type="button" onClick={() => fileInputRef.current && fileInputRef.current.click()} className="mono" style={smallBtnStyle}>REPLACE</button>
-                      <button type="button" onClick={() => setForm({ ...form, screenshot: null })} className="mono" style={{ ...smallBtnStyle, color: '#FF4D5E' }}>REMOVE</button>
-                    </div>
-                  )}
-                </div>
-              ) : readOnly ? (
-                <div className="mono" style={{ color: '#3E4753', border: '1px dashed #232A35', borderRadius: 8, padding: 16, textAlign: 'center', fontSize: 11.5 }}>NO SCREENSHOT ATTACHED</div>
-              ) : (
-                <div className="td-upload mono" onClick={() => fileInputRef.current && fileInputRef.current.click()}>
-                  <Upload size={14} /> UPLOAD CHART SCREENSHOT
-                </div>
-              )}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 1fr))', gap: 12, marginBottom: 18 }}>
+              <ScreenshotField
+                label="Before trade screenshot"
+                previewImageUrl={form.beforeScreenshotPreview || form.beforeScreenshotPreviewAccessUrl || (form.beforeScreenshotUrl && form.beforeScreenshotUrl.includes('.private.blob.vercel-storage.com') && editingId ? `${tradeDetailBasePath}/${editingId}/screenshot/before` : (form.beforeScreenshotPreviewUrl || form.beforeScreenshotUrl))}
+                fullImageUrl={form.beforeScreenshotFullLocal || form.beforeScreenshotFullAccessUrl || (form.beforeScreenshotUrl && form.beforeScreenshotUrl.includes('.private.blob.vercel-storage.com') && editingId ? `${tradeDetailBasePath}/${editingId}/screenshot/before` : form.beforeScreenshotUrl)}
+                inputRef={beforeFileInputRef}
+                readOnly={readOnly}
+                legacyPending={form.hasLegacyScreenshot && !form.beforeScreenshotUrl && !form.beforeScreenshotPreview}
+                onChange={(e) => handleScreenshotChange(e, 'before')}
+                onRemove={() => removeScreenshot('before')}
+                uploadState={screenshotUploads.before}
+              />
+              <ScreenshotField
+                label="After trade screenshot"
+                previewImageUrl={form.afterScreenshotPreview || form.afterScreenshotPreviewAccessUrl || (form.afterScreenshotUrl && form.afterScreenshotUrl.includes('.private.blob.vercel-storage.com') && editingId ? `${tradeDetailBasePath}/${editingId}/screenshot/after` : (form.afterScreenshotPreviewUrl || form.afterScreenshotUrl))}
+                fullImageUrl={form.afterScreenshotFullLocal || form.afterScreenshotFullAccessUrl || (form.afterScreenshotUrl && form.afterScreenshotUrl.includes('.private.blob.vercel-storage.com') && editingId ? `${tradeDetailBasePath}/${editingId}/screenshot/after` : form.afterScreenshotUrl)}
+                inputRef={afterFileInputRef}
+                readOnly={readOnly}
+                onChange={(e) => handleScreenshotChange(e, 'after')}
+                onRemove={() => removeScreenshot('after')}
+                uploadState={screenshotUploads.after}
+              />
             </div>
 
             <div style={{ display: 'flex', gap: 10 }}>
               <button type="button" onClick={closeForm} className="mono" style={{ flex: 1, padding: '11px 0', borderRadius: 7, border: '1px solid #1E2630', background: 'transparent', color: '#8A94A3', fontWeight: 700, fontSize: 12.5, cursor: 'pointer' }}>{readOnly ? 'CLOSE' : 'CANCEL'}</button>
               {!readOnly && (
-                <button type="submit" disabled={saving || detailLoading || detailLoadFailed} className="mono" style={{ flex: 1, padding: '11px 0', borderRadius: 7, border: 'none', background: '#00D9A3', color: '#04241C', fontWeight: 700, fontSize: 12.5, cursor: 'pointer', opacity: (saving || detailLoading || detailLoadFailed) ? 0.7 : 1 }}>
-                  {detailLoadFailed ? 'LOAD FAILED' : detailLoading ? 'LOADING…' : saving ? 'SAVING…' : editingId ? 'SAVE CHANGES' : 'LOG TRADE'}
+                <button type="submit" disabled={saving || detailLoading || detailLoadFailed || screenshotSaveBlocked} className="mono" style={{ flex: 1, padding: '11px 0', borderRadius: 7, border: 'none', background: '#00D9A3', color: '#04241C', fontWeight: 700, fontSize: 12.5, cursor: 'pointer', opacity: (saving || detailLoading || detailLoadFailed || screenshotSaveBlocked) ? 0.7 : 1 }}>
+                  {detailLoadFailed ? 'LOAD FAILED' : detailLoading ? 'LOADING…' : screenshotSaveBlocked ? 'WAIT FOR SCREENSHOT' : saving ? 'SAVING…' : editingId ? 'SAVE CHANGES' : 'LOG TRADE'}
                 </button>
               )}
             </div>
@@ -688,6 +1185,351 @@ export default function TradeJournal({ userLabel, initialTrades = [], initialSta
     </div>
   );
 }
+
+
+function ScreenshotLightbox({ src, placeholderSrc, alt, onClose }) {
+  const [scale, setScale] = useState(1);
+  const [fullLoaded, setFullLoaded] = useState(!placeholderSrc || placeholderSrc === src);
+  const [position, setPosition] = useState({ x: 0, y: 0 });
+  const pointers = useRef(new Map());
+  const gesture = useRef({ mode: null, startDistance: 0, startScale: 1, startMidpoint: null, startPosition: { x: 0, y: 0 }, startPointer: null });
+
+  useEffect(() => {
+    setFullLoaded(!placeholderSrc || placeholderSrc === src);
+  }, [src, placeholderSrc]);
+
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const handleKeyDown = (event) => {
+      if (event.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [onClose]);
+
+  function clampScale(value) {
+    return Math.min(5, Math.max(1, value));
+  }
+
+  function resetView() {
+    setScale(1);
+    setPosition({ x: 0, y: 0 });
+  }
+
+  function setZoom(nextScale) {
+    const clamped = clampScale(nextScale);
+    setScale(clamped);
+    if (clamped === 1) setPosition({ x: 0, y: 0 });
+  }
+
+  function zoomBy(amount) {
+    setZoom(scale * amount);
+  }
+
+  function handleWheel(event) {
+    event.preventDefault();
+    zoomBy(event.deltaY < 0 ? 1.16 : 1 / 1.16);
+  }
+
+  function handleDoubleClick(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (scale > 1.15) resetView();
+    else setZoom(2.5);
+  }
+
+  function distanceBetween(a, b) {
+    return Math.hypot(a.x - b.x, a.y - b.y);
+  }
+
+  function midpointBetween(a, b) {
+    return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+  }
+
+  function handlePointerDown(event) {
+    event.stopPropagation();
+    const point = { x: event.clientX, y: event.clientY };
+    pointers.current.set(event.pointerId, point);
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+
+    const active = [...pointers.current.values()];
+    if (active.length === 1) {
+      gesture.current = {
+        ...gesture.current,
+        mode: 'pan',
+        startPointer: point,
+        startPosition: { ...position },
+      };
+    } else if (active.length === 2) {
+      gesture.current = {
+        mode: 'pinch',
+        startDistance: distanceBetween(active[0], active[1]),
+        startScale: scale,
+        startMidpoint: midpointBetween(active[0], active[1]),
+        startPosition: { ...position },
+        startPointer: null,
+      };
+    }
+  }
+
+  function handlePointerMove(event) {
+    if (!pointers.current.has(event.pointerId)) return;
+    pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    const active = [...pointers.current.values()];
+
+    if (active.length >= 2 && gesture.current.mode === 'pinch') {
+      const currentDistance = distanceBetween(active[0], active[1]);
+      const currentMidpoint = midpointBetween(active[0], active[1]);
+      const ratio = gesture.current.startDistance > 0 ? currentDistance / gesture.current.startDistance : 1;
+      const nextScale = clampScale(gesture.current.startScale * ratio);
+      setScale(nextScale);
+      if (nextScale <= 1) {
+        setPosition({ x: 0, y: 0 });
+      } else {
+        setPosition({
+          x: gesture.current.startPosition.x + (currentMidpoint.x - gesture.current.startMidpoint.x),
+          y: gesture.current.startPosition.y + (currentMidpoint.y - gesture.current.startMidpoint.y),
+        });
+      }
+      return;
+    }
+
+    if (active.length === 1 && gesture.current.mode === 'pan' && scale > 1 && gesture.current.startPointer) {
+      setPosition({
+        x: gesture.current.startPosition.x + (active[0].x - gesture.current.startPointer.x),
+        y: gesture.current.startPosition.y + (active[0].y - gesture.current.startPointer.y),
+      });
+    }
+  }
+
+  function handlePointerEnd(event) {
+    pointers.current.delete(event.pointerId);
+    try { event.currentTarget.releasePointerCapture?.(event.pointerId); } catch (_) {}
+    const active = [...pointers.current.values()];
+    if (active.length === 1) {
+      gesture.current = {
+        ...gesture.current,
+        mode: 'pan',
+        startPointer: active[0],
+        startPosition: { ...position },
+      };
+    } else if (active.length === 0) {
+      gesture.current = { ...gesture.current, mode: null, startPointer: null };
+    }
+  }
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={`${alt} enlarged view`}
+      onClick={(event) => { if (event.target === event.currentTarget) onClose(); }}
+      style={{
+        position: 'fixed', inset: 0, zIndex: 1000, background: 'rgba(0,0,0,0.94)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 18,
+        backdropFilter: 'blur(8px)', WebkitBackdropFilter: 'blur(8px)',
+      }}
+    >
+      <button
+        type="button"
+        onClick={onClose}
+        aria-label="Close enlarged screenshot"
+        title="Close"
+        style={{
+          position: 'fixed', top: 16, right: 16, zIndex: 1003, width: 42, height: 42,
+          borderRadius: '50%', border: '1px solid rgba(255,255,255,0.18)', background: 'rgba(8,12,18,0.9)',
+          color: '#E8ECF1', display: 'grid', placeItems: 'center', cursor: 'pointer',
+        }}
+      >
+        <X size={22} />
+      </button>
+
+      <div
+        style={{ position: 'relative', width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden', pointerEvents: 'none' }}
+      >
+        {!fullLoaded && placeholderSrc && (
+          <img
+            src={placeholderSrc}
+            alt=""
+            aria-hidden="true"
+            draggable={false}
+            style={{
+              position: 'absolute', maxWidth: '96vw', maxHeight: '88vh', objectFit: 'contain',
+              filter: 'blur(2px)', opacity: 0.78, borderRadius: 8, pointerEvents: 'none',
+              transform: `translate3d(${position.x}px, ${position.y}px, 0) scale(${scale})`,
+              transformOrigin: 'center center',
+            }}
+          />
+        )}
+        <img
+          src={src}
+          alt={alt}
+          draggable={false}
+          onLoad={() => setFullLoaded(true)}
+          onDoubleClick={handleDoubleClick}
+          onWheel={handleWheel}
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerEnd}
+          onPointerCancel={handlePointerEnd}
+          style={{
+            maxWidth: '96vw', maxHeight: '88vh', objectFit: 'contain', userSelect: 'none', WebkitUserDrag: 'none',
+            touchAction: 'none', pointerEvents: 'auto', cursor: scale > 1 ? 'grab' : 'zoom-in',
+            opacity: fullLoaded ? 1 : 0,
+            transform: `translate3d(${position.x}px, ${position.y}px, 0) scale(${scale})`,
+            transformOrigin: 'center center', transition: pointers.current.size ? 'none' : 'transform 120ms ease-out, opacity 140ms ease',
+            boxShadow: '0 24px 80px rgba(0,0,0,0.7)', borderRadius: 8,
+          }}
+        />
+        {!fullLoaded && (
+          <div className="mono" style={{ position: 'fixed', bottom: 70, color: '#A8B3C0', fontSize: 10, pointerEvents: 'none' }}>
+            LOADING FULL RESOLUTION…
+          </div>
+        )}
+
+        <div
+          className="mono"
+          onClick={(event) => event.stopPropagation()}
+          style={{
+            position: 'fixed', left: '50%', bottom: 18, transform: 'translateX(-50%)', zIndex: 1002,
+            display: 'flex', alignItems: 'center', gap: 8, padding: '7px 9px', borderRadius: 10,
+            background: 'rgba(8,12,18,0.9)', border: '1px solid rgba(255,255,255,0.14)',
+            boxShadow: '0 10px 30px rgba(0,0,0,0.4)', pointerEvents: 'auto',
+          }}
+        >
+          <button type="button" onClick={() => zoomBy(1 / 1.25)} aria-label="Zoom out" title="Zoom out" style={lightboxControlStyle}>−</button>
+          <span style={{ minWidth: 52, textAlign: 'center', color: '#B9C4D0', fontSize: 10 }}>{Math.round(scale * 100)}%</span>
+          <button type="button" onClick={() => zoomBy(1.25)} aria-label="Zoom in" title="Zoom in" style={lightboxControlStyle}>+</button>
+          <button type="button" onClick={resetView} aria-label="Reset zoom" title="Reset zoom" style={{ ...lightboxControlStyle, width: 'auto', padding: '0 10px', fontSize: 9 }}>RESET</button>
+        </div>
+
+        <div className="mono" style={{ position: 'fixed', top: 20, left: '50%', transform: 'translateX(-50%)', color: '#7F8B98', fontSize: 9.5, letterSpacing: '0.04em', textAlign: 'center', pointerEvents: 'none' }}>
+          PINCH · MOUSE WHEEL · DOUBLE-CLICK TO ZOOM
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ScreenshotField({ label, previewImageUrl, fullImageUrl, inputRef, readOnly, legacyPending = false, onChange, onRemove, uploadState = { status: 'idle', progress: 0 } }) {
+  const [lightboxOpen, setLightboxOpen] = useState(false);
+  const [previewLoaded, setPreviewLoaded] = useState(false);
+  const isWorking = ['preparing', 'uploading', 'finalizing'].includes(uploadState.status);
+  const isRestoring = uploadState.status === 'restoring';
+  const uploadFailed = uploadState.status === 'error';
+  const restoreFailed = uploadState.status === 'restore-error';
+  const displayUrl = previewImageUrl || fullImageUrl;
+  const zoomUrl = fullImageUrl || displayUrl;
+
+  useEffect(() => {
+    if (!displayUrl) setLightboxOpen(false);
+    setPreviewLoaded(false);
+  }, [displayUrl]);
+
+  function openLightbox() {
+    if (zoomUrl) setLightboxOpen(true);
+  }
+
+  function preloadFull() {
+    if (!zoomUrl || zoomUrl === displayUrl) return;
+    const img = new Image();
+    img.src = zoomUrl;
+  }
+
+  return (
+    <div>
+      <label className="td-label">{label}</label>
+      {!readOnly && <input ref={inputRef} type="file" accept="image/jpeg,image/png,image/webp" onChange={onChange} style={{ display: 'none' }} />}
+      {displayUrl ? (
+        <div>
+          <div
+            role="button"
+            tabIndex={0}
+            aria-label={`Open ${label} full screen`}
+            title="Click to enlarge"
+            onClick={openLightbox}
+            onMouseEnter={preloadFull}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                openLightbox();
+              }
+            }}
+            style={{ position: 'relative', cursor: 'zoom-in', borderRadius: 8, overflow: 'hidden', outline: 'none', minHeight: 150, background: '#070A0E' }}
+          >
+            {!previewLoaded && (
+              <div
+                className="screenshot-loading-placeholder"
+                style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', minHeight: 150, border: '1px solid #1E2630', borderRadius: 8 }}
+              >
+                <span className="mono" style={{ color: '#687483', fontSize: 9.5 }}>LOADING PREVIEW…</span>
+              </div>
+            )}
+            <img
+              loading="eager"
+              decoding="async"
+              src={displayUrl}
+              alt={label}
+              onLoad={() => setPreviewLoaded(true)}
+              style={{ width: '100%', maxHeight: 330, objectFit: 'contain', background: '#070A0E', borderRadius: 8, border: '1px solid #1E2630', display: 'block', opacity: previewLoaded ? 1 : 0, transition: 'opacity 140ms ease' }}
+            />
+            {previewLoaded && (
+              <div className="mono" style={{ position: 'absolute', right: 8, bottom: 8, padding: '5px 7px', borderRadius: 6, background: 'rgba(4,7,11,0.78)', border: '1px solid rgba(255,255,255,0.12)', color: '#B9C4D0', fontSize: 8.5, pointerEvents: 'none' }}>
+                CLICK TO ENLARGE
+              </div>
+            )}
+          </div>
+          {lightboxOpen && <ScreenshotLightbox src={zoomUrl} placeholderSrc={displayUrl} alt={label} onClose={() => setLightboxOpen(false)} />}
+          {isWorking && (
+            <div style={{ marginTop: 8 }}>
+              <div className="mono" style={{ display: 'flex', justifyContent: 'space-between', color: '#00D9A3', fontSize: 10, marginBottom: 5 }}>
+                <span>{uploadState.status === 'preparing' ? 'OPTIMIZING…' : uploadState.status === 'finalizing' ? 'FINALIZING…' : 'UPLOADING…'}</span>
+                <span>{uploadState.status === 'uploading' ? `${uploadState.progress}%` : uploadState.status === 'finalizing' ? '100%' : ''}</span>
+              </div>
+              <div style={{ height: 4, background: '#151B23', borderRadius: 10, overflow: 'hidden' }}>
+                <div style={{ width: `${uploadState.status === 'uploading' ? uploadState.progress : uploadState.status === 'finalizing' ? 100 : 8}%`, height: '100%', background: '#00D9A3', transition: 'width 160ms ease' }} />
+              </div>
+            </div>
+          )}
+          {uploadState.status === 'uploaded' && <div className="mono" style={{ color: '#00D9A3', fontSize: 10, marginTop: 7 }}>✓ SCREENSHOT READY</div>}
+          {uploadFailed && <div className="mono" style={{ color: '#FF4D5E', fontSize: 10, marginTop: 7 }}>UPLOAD FAILED — REPLACE OR REMOVE</div>}
+          {!readOnly && (
+            <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+              <button type="button" disabled={isWorking} onClick={() => inputRef.current && inputRef.current.click()} className="mono" style={{ ...smallBtnStyle, opacity: isWorking ? 0.55 : 1 }}>REPLACE</button>
+              <button type="button" disabled={isWorking} onClick={onRemove} className="mono" style={{ ...smallBtnStyle, color: '#FF4D5E', opacity: isWorking ? 0.55 : 1 }}>REMOVE</button>
+            </div>
+          )}
+        </div>
+      ) : isRestoring || (legacyPending && !restoreFailed) ? (
+        <div className="mono" style={{ color: '#F5A623', border: '1px dashed rgba(245,166,35,0.35)', borderRadius: 8, padding: 16, textAlign: 'center', fontSize: 10.5, lineHeight: 1.5 }}>
+          RESTORING YOUR OLD SCREENSHOT…<br />THIS HAPPENS ONLY ONCE FOR THIS TRADE
+        </div>
+      ) : restoreFailed ? (
+        <div className="mono" style={{ color: '#FF4D5E', border: '1px dashed rgba(255,77,94,0.35)', borderRadius: 8, padding: 16, textAlign: 'center', fontSize: 10.5, lineHeight: 1.5 }}>
+          OLD SCREENSHOT FOUND, BUT IT COULD NOT BE RESTORED.<br />CHECK BLOB STORAGE CONFIGURATION.
+        </div>
+      ) : readOnly ? (
+        <div className="mono" style={{ color: '#3E4753', border: '1px dashed #232A35', borderRadius: 8, padding: 16, textAlign: 'center', fontSize: 11.5 }}>NO SCREENSHOT ATTACHED</div>
+      ) : (
+        <div>
+          <div className="td-upload mono" onClick={() => inputRef.current && inputRef.current.click()}>
+            <Upload size={14} /> UPLOAD {label.toUpperCase()}
+          </div>
+          {uploadFailed && <div className="mono" style={{ color: '#FF4D5E', fontSize: 10, marginTop: 7 }}>UPLOAD FAILED — CHOOSE THE IMAGE AGAIN</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const lightboxControlStyle = {
+  width: 34, height: 34, borderRadius: 7, border: '1px solid #27313D', background: '#0E141C',
+  color: '#E8ECF1', display: 'grid', placeItems: 'center', cursor: 'pointer', fontSize: 18, fontWeight: 700,
+};
 
 function StatCard({ label, value, tone, icon: Icon }) {
   const colorMap = { up: '#00D9A3', down: '#FF4D5E', amber: '#F5A623', neutral: '#E8ECF1' };

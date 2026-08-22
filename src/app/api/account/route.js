@@ -34,7 +34,9 @@ export async function GET() {
 
 export async function PATCH(req) {
   const session = await getServerSession(authOptions);
-  if (!session) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  if (!session?.user?.id || session.user.role === 'ADMIN') {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
 
   const { startingBalance } = await req.json();
   const value = Number(startingBalance);

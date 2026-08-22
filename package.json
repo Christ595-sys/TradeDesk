@@ -9,23 +9,25 @@
     "postinstall": "prisma generate",
     "db:generate": "prisma generate",
     "db:deploy": "prisma migrate deploy",
-    "db:seed-admin": "node --env-file=.env prisma/seed-admin.mjs"
+    "db:seed-admin": "node --env-file=.env prisma/seed-admin.mjs",
+    "db:migrate-screenshots": "node --env-file=.env prisma/migrate-screenshots-to-blob.mjs"
   },
   "dependencies": {
-    "next": "^14.2.5",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "next-auth": "^4.24.7",
-    "@prisma/client": "^5.18.0",
-    "bcryptjs": "^2.4.3",
-    "recharts": "^2.12.7",
-    "lucide-react": "^0.400.0"
+    "next": "15.5.23",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "next-auth": "4.24.15",
+    "@prisma/client": "5.18.0",
+    "bcryptjs": "2.4.3",
+    "recharts": "2.15.4",
+    "lucide-react": "0.400.0",
+    "@vercel/blob": "2.8.0"
   },
   "devDependencies": {
-    "prisma": "^5.18.0",
-    "tailwindcss": "^3.4.7",
-    "postcss": "^8.4.40",
-    "autoprefixer": "^10.4.19"
+    "prisma": "5.18.0",
+    "tailwindcss": "3.4.19",
+    "postcss": "8.5.26",
+    "autoprefixer": "10.5.4"
   },
   "engines": {
     "node": "24.x"

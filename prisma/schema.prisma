@@ -32,7 +32,11 @@ model Trade {
   size       Float
   pnl        Float?
   notes      String?
-  screenshot String?
+  screenshot          String?
+  beforeScreenshotUrl        String?
+  afterScreenshotUrl         String?
+  beforeScreenshotPreviewUrl String?
+  afterScreenshotPreviewUrl  String?
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 

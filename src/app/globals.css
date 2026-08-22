@@ -146,6 +146,8 @@ button, input, textarea, select { font: inherit; }
 
 @keyframes signal { to { transform: scaleY(.45); opacity: .45; } }
 @keyframes modalIn { from { opacity: 0; transform: translateY(15px) scale(.97); } }
+@keyframes screenshotPulse { 0%, 100% { opacity: .48; } 50% { opacity: .86; } }
+.screenshot-loading-placeholder { background: linear-gradient(110deg, #080d13, #111923, #080d13); animation: screenshotPulse 1.1s ease-in-out infinite; }
 
 
 /* Keep the large dashboard sections isolated so hover/animation paints stay cheap. */
