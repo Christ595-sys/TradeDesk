@@ -337,7 +337,7 @@ export default function TradeJournal({ userLabel, initialTrades = [], initialSta
       return;
     }
 
-    // A previously uploaded-but-unsaved replacement is no longer needed.
+    
     cleanupPendingScreenshotBlobs(kind);
     const requestId = screenshotUploadIds.current[kind] + 1;
     screenshotUploadIds.current[kind] = requestId;
