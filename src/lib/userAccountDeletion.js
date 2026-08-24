@@ -24,8 +24,7 @@ async function collectBlobUrls(prefix) {
 }
 
 async function deleteBlobPrefix(prefix) {
-  // Finish listing before deleting so pagination cannot be affected by items
-  // disappearing from the prefix while we are still walking its cursor.
+  
   const urls = await collectBlobUrls(prefix);
 
   for (let index = 0; index < urls.length; index += DELETE_BATCH_SIZE) {
@@ -36,9 +35,8 @@ async function deleteBlobPrefix(prefix) {
 export async function deleteAllUserScreenshotBlobs(userId) {
   if (!userId) throw new Error('User id is required for screenshot cleanup.');
 
-  // Current TradeDesk uploads (Before/After, full + preview, including orphans).
+  
   await deleteBlobPrefix(`trade-screenshots/${userId}/`);
 
-  // Compatibility with legacy Before screenshots restored by older builds.
   await deleteBlobPrefix(`trade-screenshots/legacy-before/${userId}/`);
 }
