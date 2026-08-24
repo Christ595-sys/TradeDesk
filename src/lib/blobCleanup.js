@@ -15,7 +15,6 @@ export async function deleteOwnedBlobReferences(references, userId) {
     .filter((reference) => isOwnedTradeScreenshotReference(reference, userId));
   if (!unique.length) return;
 
-  // Vercel Blob accepts either full URLs or pathnames for delete operations.
   const normalized = unique.map((reference) => {
     if (/^https?:\/\//i.test(reference)) return reference;
     return blobPathnameFromReference(reference);

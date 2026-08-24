@@ -1,18 +1,14 @@
-# Dependencies / build output
 node_modules/
 .next/
 out/
 coverage/
 
-# Environment secrets
 .env
 .env.local
 .env.*.local
 
-# Vercel local project metadata
 .vercel/
 
-# Logs / local OS files
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

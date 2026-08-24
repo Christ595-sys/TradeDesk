@@ -24,13 +24,8 @@ export async function DELETE(_request, { params }) {
   }
 
   try {
-    // Clean the user's entire screenshot namespace first, including abandoned
-    // uploads that are not referenced by a saved trade. If this fails, keep
-    // the database account intact so the deletion can be retried safely.
     await deleteAllUserScreenshotBlobs(user.id);
 
-    // Trade.user uses onDelete: Cascade, so deleting the user permanently
-    // removes all trades, notes, balances and legacy screenshot data.
     const deleted = await prisma.user.deleteMany({
       where: { id: user.id, role: 'USER' },
     });
