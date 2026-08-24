@@ -76,8 +76,7 @@ export async function POST(request) {
     const previewPathname = `${base}-preview.${extensionFor(preview.contentType)}`;
     const validUntil = Date.now() + URL_TTL_MS;
 
-    // The client receives only two exact, short-lived PUT URLs. It never
-    // receives the broader delegation token used on the server to mint them.
+  
     const token = await getUploadToken(validUntil);
 
     const [fullSigned, previewSigned] = await Promise.all([
