@@ -4,7 +4,6 @@ export function blobPathnameFromReference(value) {
   if (typeof value !== 'string' || !value.trim()) return null;
   const trimmed = value.trim();
 
-  // Cleanup can safely work with a Blob pathname as well as a full Blob URL.
   if (!/^https?:\/\//i.test(trimmed)) {
     return trimmed.replace(/^\/+/, '');
   }
@@ -33,7 +32,7 @@ function allowedPrefixes(userId, kind = null) {
   const prefixes = [];
   if (!kind || kind === 'before') prefixes.push(`trade-screenshots/${userId}/before/`);
   if (!kind || kind === 'after') prefixes.push(`trade-screenshots/${userId}/after/`);
-  // Compatibility with screenshots restored by older TradeDesk builds.
+
   if (!kind || kind === 'before') prefixes.push(`trade-screenshots/legacy-before/${userId}/`);
   return prefixes;
 }
