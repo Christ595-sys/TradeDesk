@@ -100,13 +100,7 @@ export default function TradeJournal({ userLabel, initialTrades = [], initialSta
   const beforeFileInputRef = useRef(null);
   const afterFileInputRef = useRef(null);
   const screenshotUploadIds = useRef({ before: 0, after: 0 });
-  // Keep the exact short-lived signed URLs while this dashboard is open.
-  // Reopening the same trade can then reuse the browser's image cache instead
-  // of waiting for another signing round-trip before showing screenshots.
   const screenshotAccessCache = useRef(new Map());
-  // Tracks files uploaded during the currently open form but not yet attached
-  // to a saved trade. This lets us clean them up if the user closes/replaces
-  // the screenshot before saving, so the Blob store does not accumulate orphans.
   const pendingScreenshotBlobs = useRef({ before: null, after: null });
 
   function pendingReferences(kind = null) {
@@ -319,14 +313,11 @@ export default function TradeJournal({ userLabel, initialTrades = [], initialSta
         return new File([blob], `${base}-${suffix}.webp`, { type: 'image/webp' });
       };
 
-      // The full image keeps enough detail for the zoom viewer but stays small
-      // enough for quick direct uploads on typical mobile connections.
+      
       let fullFile = await render(1600, 1200, 0.76, 'full');
       if (fullFile.size > 1200 * 1024) fullFile = await render(1400, 1050, 0.66, 'full');
       if (fullFile.size > 1200 * 1024) fullFile = await render(1200, 900, 0.58, 'full');
 
-      // This is the image shown inside the trade modal. It is intentionally
-      // much smaller so the trade opens quickly; zoom uses the full image.
       let previewFile = await render(800, 600, 0.58, 'preview');
       if (previewFile.size > 350 * 1024) previewFile = await render(680, 510, 0.5, 'preview');
 
@@ -496,10 +487,6 @@ export default function TradeJournal({ userLabel, initialTrades = [], initialSta
       onProgress?.(Math.min(98, Math.max(1, (current / totalBytes) * 100)));
     };
 
-    // Fast path: the browser writes straight to the private Blob store with
-    // short-lived signed PUT URLs. If that direct connection is unreliable on
-    // a particular network/browser, automatically fall back to V11's proven
-    // authenticated TradeDesk server upload instead of leaving the UI stuck.
     try {
       const targets = await requestScreenshotUploadUrls(fullFile, previewFile, kind);
       const sent = { full: false, preview: false };
@@ -529,9 +516,7 @@ export default function TradeJournal({ userLabel, initialTrades = [], initialSta
         return { fullUrl: fullResult.url, previewUrl: previewResult.url };
       }
 
-      // If one direct PUT completed and the other failed (or a response was
-      // lost), delete both generated pathnames before switching to fallback.
-      // Vercel Blob delete is safe when a pathname does not exist.
+  
       await cleanupScreenshotReferences([targets.full.pathname, targets.preview.pathname]);
       const firstFailure = directResults.find((result) => result.status === 'rejected');
       throw firstFailure?.reason || new Error('Direct screenshot upload failed.');
@@ -668,9 +653,7 @@ export default function TradeJournal({ userLabel, initialTrades = [], initialSta
         setSaving(false);
         return;
       }
-      // The database has accepted these Blob URLs. From this point on they
-      // are no longer temporary/orphan candidates even if rendering the
-      // response later fails on the client.
+      
       markPendingScreenshotsCommitted();
       const saved = await res.json();
       if (editingId) screenshotAccessCache.current.delete(editingId);
