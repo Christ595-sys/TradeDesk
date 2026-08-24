@@ -87,8 +87,7 @@ export async function PATCH(req, { params }) {
   if (beforeScreenshotPreviewUrl !== undefined) data.beforeScreenshotPreviewUrl = beforeScreenshotPreviewUrl || null;
   if (afterScreenshotPreviewUrl !== undefined) data.afterScreenshotPreviewUrl = afterScreenshotPreviewUrl || null;
 
-  // When a legacy screenshot has been replaced by a new Before image, the old
-  // base64 payload is no longer needed in PostgreSQL.
+ 
   if (existing.hasLegacyScreenshot && beforeScreenshotUrl) data.screenshot = null;
 
   const trade = await prisma.trade.update({
